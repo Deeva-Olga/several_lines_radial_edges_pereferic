@@ -1,0 +1,319 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import os
+import cv2
+import pandas as pd
+import numpy as np
+from PIL import Image
+from matplotlib import pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+from sklearn.ensemble import RandomForestClassifier
+from joblib import dump, load
+import pickle
+
+def thresh_hold_gray(src, thresh):
+    ret,thresh_src = cv2.threshold(src, thresh, 255, cv2.THRESH_BINARY)
+    contours, hierarchy = cv2.findContours(thresh_src, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    src_contours = np.zeros(src.shape)
+    cv2.drawContours(src_contours, contours, -1, (255,255,255), 1)
+    #cv2_imshow(thresh_src)
+    return (thresh_src)
+
+def thresh_hold_gray_inv(src, thresh):
+    ret,thresh_src = cv2.threshold(src, thresh, 255, cv2.THRESH_BINARY_INV)
+    contours, hierarchy = cv2.findContours(thresh_src, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    src_contours = np.zeros(src.shape)
+    cv2.drawContours(src_contours, contours, -1, (255,255,255), 1)
+    #cv2_imshow(thresh_src)
+    return (thresh_src)
+
+def rgb2hsv_return_h(img):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h,s,v = cv2.split(hsv)
+    return(h)
+
+def rgb2lab_return_l(img):
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l,a,b=cv2.split(lab)
+    return(l)
+
+def masking(img, mask):
+    img_BGRA=cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+    masked = cv2.bitwise_and(img_BGRA, img_BGRA, mask=mask)
+    masked[mask < 2] = [0, 0, 0, 0]
+    return(masked)
+
+def black_hat(src):
+  filterSize =(50,50)
+  kernel = cv2.getStructuringElement(cv2.MORPH_RECT, filterSize)
+  blackhat_img = cv2.morphologyEx(src,cv2.MORPH_BLACKHAT,kernel)
+  #cv2_imshow(blackhat_img)
+  return(blackhat_img)
+
+def top_hat(src):
+  filterSize =(50,50)
+  kernel = cv2.getStructuringElement(cv2.MORPH_RECT, filterSize)
+  tophat_img = cv2.morphologyEx(src, cv2.MORPH_TOPHAT,kernel)
+  #cv2_imshow(tophat_img)
+  return(tophat_img)
+
+def make_avrg_127(src):
+  src=np.float32(src)
+  mean=np.mean(src)
+  dif=mean-127
+  return(float_to_byte(src-dif))
+
+def float_to_byte (src):
+  width,height=src.shape[:2]
+  for x in range(width):
+    for y in range(height):
+      #if intensity less than threshold, assign white
+      if src[x,y] < 0:
+        src[x,y]=0
+      #if intensity greater than threshold, assign black
+      if src[x,y] >255:
+        src[x,y]=255
+  return(src.astype(np.uint8))
+
+def increase_sharpness_byte(src, r_blur, coeff):
+  src_avg=cv2.blur(src, (r_blur, r_blur))
+  src_average=np.float32(src_avg)
+  dif=src-src_average
+  dst=make_avrg_127(src_average)+coeff*dif
+  width,height=dst.shape[:2]
+  dst=float_to_byte(dst)
+  return(dst)
+
+def counters_canny(byte):
+  canny = cv2.Canny(byte, 30, 150)
+  img_cnt = cv2.dilate(canny, (1, 1), iterations=0)
+  plt.imshow(img_cnt, cmap='gray')
+  return(img_cnt)
+
+def filter_counters(dilated, img):
+  (cnt, hierarchy) = cv2.findContours(dilated.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+  cnt_filtered=[]
+  for j in range(0,len(cnt)):
+    area = cv2.contourArea(cnt[j])
+    arclen = cv2.arcLength(cnt[j], True)
+    if ((area > 100)):
+      cnt_filtered.append(cnt[j])
+    j=j+1
+  return(cnt_filtered)
+
+def cntr_of_strc (cnt_sorted, img):
+  x_array=[]
+  y_array=[]
+  for j in range(0,len(cnt_sorted)):
+    ((x, y), radius) = cv2.minEnclosingCircle(cnt_sorted[j])
+    #cv2.circle(img, (int(x), int(y)), int(radius), (0, 255, 0), 2)
+    #cv2.circle(img, (int(x), int(y)), 5, (0, 0, 255), -1)
+    x_array.append(x)
+    y_array.append(y)
+  return(x_array, y_array)
+
+def overlaying(background, img, x, y):
+    overlay = background.copy()
+    place = overlay[y: y + img.shape[0], x: x + img.shape[1]]
+    a = img[..., 3:].repeat(3, axis=2).astype('uint16')
+    place[..., :3] = (place[..., :3].astype('uint16') * (255 - a) // 255) + img[..., :3].astype('uint16') * a // 255
+    return(overlay)
+
+def distance(x, y, y_0, x_0):
+  d = ((x-x_0)**2+(y-y_0)**2)**(0.5)
+  return(d)
+
+  #  cv2.equalizeHist(img_gray)
+
+def background(img):
+  gray=cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+  #cv2_imshow(gray)
+  res=gray
+  nx = img.shape[1]
+  ny = img.shape[0]
+  count=0
+  back=0
+  for ix in range(nx):
+    back+=gray[ny-1, ix]
+    back+=gray[0, ix]
+    count+=2
+  for iy in range(ny):
+    back+=gray[iy, nx-1]
+    back+=gray[iy, 0]
+    count+=2
+  backgr=back/count
+  for ix in range(nx):
+    for iy in range(ny):
+      res[iy,ix]=gray[iy,ix]+backgr
+      if res[iy, ix]<0:
+        res[iy,ix]=255
+      if res[iy, ix]>255:
+        res[iy,ix]=255
+  return(backgr)
+
+def center_of_nevus(img):
+  kernel = np.ones((17,17),np.uint8)
+  byte=cv2.morphologyEx(cv2.morphologyEx(thresh_hold_gray_inv(rgb2lab_return_l(img), 150), cv2.MORPH_OPEN, kernel),cv2.MORPH_CLOSE, kernel)
+  width=img.shape[1]
+  height = img.shape[0]
+  x=0
+  y=0
+  weight=0
+  for j in range(width):
+    for i in range(height):
+      if byte[i,j]>0:
+        x=x+j
+        y=y+i
+        weight=weight+1
+  xc=x/weight if weight>0 else width/2
+  yc=y/weight if weight>0 else height/2
+  return(xc, yc)
+
+
+def radius(img, x_0,y_0):
+  kernel = np.ones((17,17),np.uint8)
+  mask=cv2.morphologyEx(cv2.morphologyEx(thresh_hold_gray_inv(rgb2lab_return_l(img), 150), cv2.MORPH_OPEN, kernel),cv2.MORPH_CLOSE, kernel)
+  nx = img.shape[1]
+  ny = img.shape[0]
+  r_x_right=0
+  i_x_right=0
+  r_x_left=0
+  i_x_left=0
+  r_y_up=0
+  i_y_up=0
+  r_y_down=0
+  i_y_down=0
+  for ix in range(nx):
+    for iy in range(ny):
+      if mask[iy,ix]>0:
+        if ix>x_0:
+          r_x_right += (ix - x_0)
+          i_x_right+=1
+        else:
+          r_x_left += (x_0 - ix)
+          i_x_left+=1
+        if iy>y_0:
+          r_y_up += (iy-y_0)
+          i_y_up+=1
+        else:
+          r_y_down += (y_0-iy)
+          i_y_down+=1
+  r=r_x_right/i_x_right+r_x_left/i_x_left+r_y_up/i_y_up+r_y_down/i_y_down
+  return(r/2)
+
+def average_in_nevus(img, circle):
+    img_circle = img.copy()
+    gray = cv2.cvtColor(img_circle, cv2.COLOR_BGR2GRAY)
+    mask = np.zeros_like(gray)
+    circle = np.array(circle)
+    x0, y0 = int(circle[0]), int(circle[1])
+    r=int(circle[2])
+    cv2.circle(img_circle, (x0, y0), r, (0, 0, 255), 2)
+    cv2.circle(mask, (x0, y0), r, 255, -1)
+    #cv2_imshow(mask)
+    # get average color with mask
+    ave_color = cv2.mean(img, mask=mask)[:3]
+    return(ave_color)
+
+def average_in_mask(img, mask):
+    ave_color = cv2.mean(img, mask=mask)[:3]
+    return(ave_color)
+
+def get_mask(img, bg):
+    gray=cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    ret,thresh_src = cv2.threshold(gray, bg-45, 255, cv2.THRESH_BINARY_INV)
+    ret,thresh_src_2 = cv2.threshold(gray, bg+45, 255, cv2.THRESH_BINARY)
+    return(thresh_src_2+thresh_src)
+
+def get_image_features(img: np.ndarray) -> dict:
+    features = {}
+    """x_0,y_0=center_of_nevus(img)
+    rad=radius(img, x_0,y_0)
+    width=img.shape[1]
+    height = img.shape[0]
+    r, g, b = average_in_nevus(img, [width/2, height/2, 500])"""
+    bg=background(img)
+    mask=get_mask(img, bg)
+    r, g, b =cv2.mean(img, mask=mask)[:3]
+    features['r'] = r
+    features['g'] = g
+    features['b'] = b
+    return features
+
+def process_images_from_directory(directory: str, label: int) -> pd.DataFrame:
+    file_list = os.listdir(directory)
+    data = []
+
+    for file in file_list:
+        img_path = os.path.join(directory, file)
+        print(img_path)
+        img = cv2.imread(img_path)
+        features = get_image_features(img)
+        features['image'] = file
+        features['label'] = label
+        data.append(features)
+
+    return pd.DataFrame(data)
+
+def train_classifier():
+    """
+    Trains classifier
+    :return: classifier
+    """
+    if not os.path.exists('all_per.csv'):
+        all_df = pd.concat([
+            process_images_from_directory('C:/study/ne_brosit/peripheralines/light_new', 1),
+            process_images_from_directory('C:/study/ne_brosit/peripheralines/dark_new', 0)
+        ])
+        all_df.to_csv('all_per.csv', index=False)
+    else:
+        all_df = pd.read_csv('all_per.csv')
+    print(all_df.head())
+    x_train, x_test, y_train, y_test = train_test_split(all_df.drop(['image', 'label'], axis=1), all_df['label'],
+                                                        test_size=0.2, stratify=all_df['label'], shuffle=True, random_state=33)
+
+    clf = RandomForestClassifier(n_estimators=100, random_state=33)
+    clf.fit(x_train, y_train)
+
+    y_pred = clf.predict(x_test)
+    print(classification_report(y_test, y_pred))
+
+    return clf
+
+
+"""def classify_image(img: np.ndarray, classifier) -> str:
+    
+    Classifies image
+    :param img: image to classify
+    :param classifier: classifier to use
+    :return: predicted label
+    
+    features = get_image_features(img)
+    df = pd.DataFrame([features])
+    pred = classifier.predict(df)
+    if pred == 0:
+        return 'СВЕТЛАЯ БЕССТРУКТУРНАЯ ОБЛАСТЬ'
+    if pred == 1:
+        return 'ТЕМНАЯ БЕССТРУКТУРНАЯ ОБЛАСТЬ'"""
+
+def main(img: np.ndarray):
+  clf = load('several_lines_radial_edges_pereferic.joblib')
+  features = get_image_features(img)
+  df = pd.DataFrame([features])
+  pred = clf.predict(df)
+  if pred == 0:
+     return 'СВЕТЛАЯ БЕССТРУКТУРНАЯ ОБЛАСТЬ'
+  if pred == 1:
+     return 'ТЕМНАЯ БЕССТРУКТУРНАЯ ОБЛАСТЬ'
+
+if __name__ == "__main__":
+    image_path = 'dataset/0-499.jpg'
+    image = cv2.imread(image_path)
+    label = main(image)
+    #print(label)
+
+
+
+
